@@ -29,7 +29,8 @@ config ESP32_S3_BOX_BOARD
     bool "ESP32-S3-BOX"
 config ESP32_C3_LYRA_V2_BOARD
     bool "ESP32-C3-Lyra-v2.0"
-
+config ESP_AI_THINKER_V2_297_BOARD
+    bool "ESP32-AiThinker-Audio V2.297"
 endchoice
 
 choice ESP32_KORVO_DU1906_DAC
