@@ -36,8 +36,6 @@
 #include "wifi_service.h"
 #include "smart_config.h"
 
-#include "audio_tone_uri.h"
-#include "audio_player_int_tone.h"
 #include "media_lib_adapter.h"
 #include "audio_idf_version.h"
 
@@ -47,7 +45,14 @@
 #include "tcpip_adapter.h"
 #endif
 
-static const char *TAG = "VOIP_EXAMPLE";
+#define GPIO_MONITOR        GPIO_NUM_21
+#define GPIO_DOOR           GPIO_NUM_22
+#define GPIO_HANDSET        GPIO_NUM_19
+#define GPIO_MONITOR_SENSOR GPIO_NUM_23
+
+#define SIP_CALL_NUMBER     "11"
+
+static const char *TAG = "INTERCOM";
 
 /* Debug original input/output data for AEC feature*/
 #define DEBUG_AEC_INPUT     0
@@ -74,9 +79,45 @@ static ringbuf_handle_t ringbuf_ref;
 static sip_handle_t sip;
 static audio_element_handle_t raw_read, raw_write, element_algo;
 static audio_pipeline_handle_t recorder, player;
-static bool mute, is_smart_config;
+static bool is_smart_config, is_monitor_on;
 static display_service_handle_t disp;
 static periph_service_handle_t wifi_serv;
+
+static QueueHandle_t gpio_evt_queue = NULL;
+
+static void IRAM_ATTR gpio_isr_handler(void *arg)
+{
+    uint32_t gpio_num = (uint32_t)arg;
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+static void gpio_task(void *arg)
+{
+    uint32_t io_num;
+    for (;;) {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            if ((io_num == GPIO_MONITOR_SENSOR) && is_monitor_on != gpio_get_level(io_num)) {
+                sip_state_t sip_state = esp_sip_get_state(sip);
+                is_monitor_on = gpio_get_level(io_num);
+                ESP_LOGI(TAG, "GPIO[%d] intr, val: %d, is_monitor_on %d", io_num, gpio_get_level(io_num), is_monitor_on);
+                if (is_monitor_on && (sip_state & SIP_STATE_REGISTERED)) {
+                    esp_sip_uac_invite(sip, SIP_CALL_NUMBER);
+                } else if (!is_monitor_on && (sip_state & SIP_STATE_ON_CALL)) {
+                    esp_sip_uac_bye(sip);
+                } else if (!is_monitor_on && ((sip_state & SIP_STATE_CALLING) || (sip_state & SIP_STATE_SESS_PROGRESS))) {
+                    esp_sip_uac_cancel(sip);
+                }
+            }
+        }
+    }
+}
+
+static void pulse_gpio(gpio_num_t gpio_num_t)
+{
+    gpio_set_level(gpio_num_t, 1);
+    vTaskDelay(25);
+    gpio_set_level(gpio_num_t, 0);
+}
 
 static esp_err_t i2s_driver_init(i2s_port_t port, i2s_channel_fmt_t channels, i2s_bits_per_sample_t bits)
 {
@@ -282,11 +323,10 @@ static int _sip_event_handler(sip_event_msg_t *event)
             return ip_len;
         case SIP_EVENT_REGISTERED:
             ESP_LOGI(TAG, "SIP_EVENT_REGISTERED");
-            audio_player_int_tone_play(tone_uri[TONE_TYPE_SERVER_CONNECT]);
             break;
         case SIP_EVENT_RINGING:
             ESP_LOGI(TAG, "ringing... RemotePhoneNum %s", (char *)event->data);
-            audio_player_int_tone_play(tone_uri[TONE_TYPE_ALARM]);
+            esp_sip_uas_answer(sip, true);
             break;
         case SIP_EVENT_INVITING:
             ESP_LOGI(TAG, "SIP_EVENT_INVITING Remote Ring...");
@@ -303,6 +343,10 @@ static int _sip_event_handler(sip_event_msg_t *event)
             player_pipeline_open();
             audio_pipeline_run(player);
             audio_pipeline_run(recorder);
+            if (!is_monitor_on) {
+                pulse_gpio(GPIO_MONITOR);
+            }
+            gpio_set_level(GPIO_HANDSET, 1);
             break;
         case SIP_EVENT_AUDIO_SESSION_END:
             ESP_LOGI(TAG, "SIP_EVENT_AUDIO_SESSION_END");
@@ -312,6 +356,7 @@ static int _sip_event_handler(sip_event_msg_t *event)
             audio_pipeline_stop(recorder);
             audio_pipeline_wait_for_stop(recorder);
             audio_pipeline_deinit(recorder);
+            gpio_set_level(GPIO_HANDSET, 0);
             break;
         case SIP_EVENT_READ_AUDIO_DATA:
 #if (DEBUG_AEC_INPUT || DEBUG_AEC_OUTPUT)
@@ -325,6 +370,10 @@ static int _sip_event_handler(sip_event_msg_t *event)
             return raw_stream_write(raw_write, (char *)event->data, event->data_len);
         case SIP_EVENT_READ_DTMF:
             ESP_LOGI(TAG, "SIP_EVENT_READ_DTMF ID : %d ", ((char *)event->data)[0]);
+            if (((char *)event->data)[0] == 1) {
+                ESP_LOGI(TAG, "SIP_EVENT_READ_DTMF 1 OPEN DOOR");
+                pulse_gpio(GPIO_DOOR);
+            }
             break;
     }
     return 0;
@@ -332,8 +381,6 @@ static int _sip_event_handler(sip_event_msg_t *event)
 
 static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_service_event_t *evt, void *ctx)
 {
-    audio_board_handle_t board_handle = (audio_board_handle_t) ctx;
-    int player_volume;
     if (evt->type == INPUT_KEY_SERVICE_ACTION_CLICK_RELEASE) {
         ESP_LOGD(TAG, "[ * ] input key id is %d", (int)evt->data);
         sip_state_t sip_state = esp_sip_get_state(sip);
@@ -342,71 +389,13 @@ static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_ser
         }
         switch ((int)evt->data) {
             case INPUT_KEY_USER_ID_REC:
-            case INPUT_KEY_USER_ID_MUTE:
-                ESP_LOGI(TAG, "[ * ] [Rec] Set MIC Mute or not");
-                if (mute) {
-                    mute = false;
-                    display_service_set_pattern(disp, DISPLAY_PATTERN_TURN_OFF, 0);
-                } else {
-                    mute = true;
-                    display_service_set_pattern(disp, DISPLAY_PATTERN_TURN_ON, 0);
-                }
-#if CONFIG_ESP_LYRAT_MINI_V1_1_BOARD
-                audio_hal_set_mute(board_handle->adc_hal, mute);
-#endif
-                break;
-            case INPUT_KEY_USER_ID_PLAY:
-                ESP_LOGI(TAG, "[ * ] [Play] input key event");
-                if (sip_state == SIP_STATE_RINGING) {
-                    audio_player_int_tone_stop();
-                    esp_sip_uas_answer(sip, true);
-                } else if (sip_state == SIP_STATE_REGISTERED) {
-                    esp_sip_uac_invite(sip, "101");
-                }
-                break;
-            case INPUT_KEY_USER_ID_MODE:
-            case INPUT_KEY_USER_ID_SET:
-                if (sip_state & SIP_STATE_RINGING) {
-                    audio_player_int_tone_stop();
-                    esp_sip_uas_answer(sip, false);
-                } else if (sip_state & SIP_STATE_ON_CALL) {
-                    esp_sip_uac_bye(sip);
-                } else if ((sip_state & SIP_STATE_CALLING) || (sip_state & SIP_STATE_SESS_PROGRESS)) {
-                    esp_sip_uac_cancel(sip);
-                }
-                break;
-            case INPUT_KEY_USER_ID_VOLUP:
-                ESP_LOGD(TAG, "[ * ] [Vol+] input key event");
-                audio_hal_get_volume(board_handle->audio_hal, &player_volume);
-                player_volume += 10;
-                if (player_volume > 100) {
-                    player_volume = 100;
-                }
-                audio_hal_set_volume(board_handle->audio_hal, player_volume);
-                ESP_LOGI(TAG, "[ * ] Volume set to %d %%", player_volume);
-                break;
-            case INPUT_KEY_USER_ID_VOLDOWN:
-                ESP_LOGD(TAG, "[ * ] [Vol-] input key event");
-                audio_hal_get_volume(board_handle->audio_hal, &player_volume);
-                player_volume -= 10;
-                if (player_volume < 0) {
-                    player_volume = 0;
-                }
-                audio_hal_set_volume(board_handle->audio_hal, player_volume);
-                ESP_LOGI(TAG, "[ * ] Volume set to %d %%", player_volume);
-                break;
-        }
-    } else if (evt->type == INPUT_KEY_SERVICE_ACTION_PRESS) {
-        switch ((int)evt->data) {
-            case INPUT_KEY_USER_ID_SET:
+                ESP_LOGI(TAG, "[ * ] Smart config started.");
                 is_smart_config = true;
                 esp_sip_destroy(sip);
                 wifi_service_setting_start(wifi_serv, 0);
-                audio_player_int_tone_play(tone_uri[TONE_TYPE_UNDER_SMARTCONFIG]);
                 break;
         }
     }
-
     return ESP_OK;
 }
 
@@ -432,12 +421,8 @@ static esp_err_t wifi_service_cb(periph_service_handle_t handle, periph_service_
         esp_sip_start(sip);
     } else if (evt->type == WIFI_SERV_EVENT_DISCONNECTED) {
         ESP_LOGI(TAG, "PERIPH_WIFI_DISCONNECTED [%d]", __LINE__);
-        if (is_smart_config == false) {
-            audio_player_int_tone_play(tone_uri[TONE_TYPE_PLEASE_SETTING_WIFI]);
-        }
     } else if (evt->type == WIFI_SERV_EVENT_SETTING_TIMEOUT) {
         ESP_LOGW(TAG, "WIFI_SERV_EVENT_SETTING_TIMEOUT [%d]", __LINE__);
-        audio_player_int_tone_play(tone_uri[TONE_TYPE_PLEASE_SETTING_WIFI]);
         is_smart_config = false;
     }
 
@@ -463,6 +448,28 @@ void setup_wifi()
     strncpy((char *)&sta_cfg.sta.password, CONFIG_WIFI_PASSWORD, sizeof(sta_cfg.sta.password));
     wifi_service_set_sta_info(wifi_serv, &sta_cfg);
     wifi_service_connect(wifi_serv);
+}
+
+void setup_gpio()
+{
+    gpio_pad_select_gpio(GPIO_MONITOR);
+    gpio_pad_select_gpio(GPIO_DOOR);
+    gpio_pad_select_gpio(GPIO_HANDSET);
+    gpio_pad_select_gpio(GPIO_MONITOR_SENSOR);
+
+    gpio_set_direction(GPIO_MONITOR, GPIO_MODE_OUTPUT);
+    gpio_set_direction(GPIO_DOOR, GPIO_MODE_OUTPUT);
+    gpio_set_direction(GPIO_HANDSET, GPIO_MODE_OUTPUT);
+    gpio_set_direction(GPIO_MONITOR_SENSOR, GPIO_MODE_INPUT);
+
+    gpio_pulldown_en(GPIO_MONITOR_SENSOR);
+
+    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+    xTaskCreate(gpio_task, "gpio_task", 2048, NULL, 10, NULL);
+
+    gpio_set_intr_type(GPIO_MONITOR_SENSOR, GPIO_INTR_ANYEDGE);
+
+    gpio_isr_handler_add(GPIO_MONITOR_SENSOR, gpio_isr_handler, (void *)GPIO_MONITOR_SENSOR);
 }
 
 void app_main()
@@ -517,7 +524,7 @@ void app_main()
     audio_board_handle_t board_handle = audio_board_init();
 #endif
     audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
-    audio_hal_set_volume(board_handle->audio_hal, 60);
+    audio_hal_set_volume(board_handle->audio_hal, 80);
 
 #if CONFIG_ESP_LYRAT_MINI_V1_1_BOARD
     i2s_driver_init(I2S_NUM_1, I2S1_CHANNELS, I2S_BITS);
@@ -527,9 +534,9 @@ void app_main()
     input_key_service_add_key(input_ser, input_key_info, INPUT_KEY_NUM);
     periph_service_set_callback(input_ser, input_key_service_cb, (void *)board_handle);
 
-    ESP_LOGI(TAG, "[ 3 ] Initialize tone player");
-    audio_player_int_tone_init(I2S_SAMPLE_RATE, I2S0_CHANNELS, I2S_BITS);
-
-    ESP_LOGI(TAG, "[ 4 ] Create Wi-Fi service instance");
+    ESP_LOGI(TAG, "[ 3 ] Create Wi-Fi service instance");
     setup_wifi();
+
+    ESP_LOGI(TAG, "[ 4 ] Setting up GPIO pins");
+    setup_gpio();
 }

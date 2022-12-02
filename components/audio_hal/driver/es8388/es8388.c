@@ -300,13 +300,19 @@ esp_err_t es8388_init(audio_hal_codec_config_t *cfg)
     }
     res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL2, tmp);  //0x00 LINSEL & RINSEL, LIN1/RIN1 as ADC Input; DSSEL,use one DS Reg11; DSR, LINPUT1-RINPUT1
     res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL3, 0x02);
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL4, 0x0c); // 16 Bits length and I2S serial audio data forma
+    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL4, 0x0d);  //Left/Right data, Left/Right justified mode, Bits length, I2S format
     res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL5, 0x02);  //ADCFsMode,singel SPEED,RATIO=256
     //ALC for Microphone
     res |= es8388_set_adc_dac_volume(ES_MODULE_ADC, 0, 0);      // 0db
     res |= es_write_reg(ES8388_ADDR, ES8388_ADCPOWER, 0x09); //Power on ADC, Enable LIN&RIN, Power off MICBIAS, set int1lp to low power mode
+    //PGA ALC/AGC
+    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL10, 0xD0);  // Reg 0x12 (ALC enable, PGA Max. Gain = 5.5dB, Min. Gain = -12dB)
+    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL11, 0x70);  // Reg 0x13 (ALC Target = -6dB, ALC Hold time = 0 mS)
+    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL12, 0x12);  // Reg 0x14 (Decay time = 820uS , Attack time = 416 uS)
+    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL13, 0x06);  // Reg 0x15 (ALC mode) 96 Samples
+    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL14, 0x00);  // Reg 0x16 (noise gate = -40.5dB, NGG = 0x01(mute ADC))
     /* enable es8388 PA */
-    es8388_pa_power(true);
+    es8388_pa_power(false);
     ESP_LOGI(ES_TAG, "init,out:%02x, in:%02x", cfg->dac_output, cfg->adc_input);
     return res;
 }
@@ -355,8 +361,15 @@ esp_err_t es8388_set_voice_volume(int volume)
     volume /= 3;
     res = es_write_reg(ES8388_ADDR, ES8388_DACCONTROL24, volume);
     res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL25, volume);
+#if CONFIG_ESP_AI_THINKER_V2_297_BOARD
+    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL4, volume);
+    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL5, volume);
+    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL26, volume);
+    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL27, volume);
+#else
     res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL26, 0);
     res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL27, 0);
+#endif  
     return res;
 }
 
